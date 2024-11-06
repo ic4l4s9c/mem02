@@ -5,7 +5,7 @@ import logging
 import uuid
 import warnings
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import pytz
 from pydantic import ValidationError
@@ -15,13 +15,14 @@ from mem0.configs.prompts import get_update_memory_messages
 from mem0.memory.base import MemoryBase
 from mem0.memory.setup import setup_config
 from mem0.memory.storage import SQLiteManager
-from mem0.memory.utils import get_fact_retrieval_messages, parse_messages
+from mem0.memory.utils import get_fact_retrieval_messages, stringify_messages
 from mem0.utils.factory import EmbedderFactory, LlmFactory, VectorStoreFactory
 
 # Setup user config
 setup_config()
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class Memory(MemoryBase):
@@ -52,19 +53,19 @@ class Memory(MemoryBase):
         try:
             config = MemoryConfig(**config_dict)
         except ValidationError as e:
-            logger.error(f"Configuration validation error: {e}")
+            logger.error("configuration validation error: %s", e)
             raise
         return cls(config)
 
     def add(
         self,
-        messages,
-        user_id=None,
-        agent_id=None,
-        run_id=None,
-        metadata=None,
-        filters=None,
-        prompt=None,
+        messages: str | List[Dict[str, str]],
+        user_id: str = None,
+        agent_id: str = None,
+        run_id: str = None,
+        metadata: Dict = None,
+        filters: Dict = None,
+        prompt: str = None,
     ):
         """
         Create a new memory.
@@ -76,7 +77,7 @@ class Memory(MemoryBase):
             run_id (str, optional): ID of the run creating the memory. Defaults to None.
             metadata (dict, optional): Metadata to store with the memory. Defaults to None.
             filters (dict, optional): Filters to apply to the search. Defaults to None.
-            prompt (str, optional): Prompt to use for memory deduction. Defaults to None.
+            prompt (str, unused): Prompt to use for memory deduction. Defaults to None.
 
         Returns:
             dict: A dictionary containing the result of the memory addition operation.
@@ -84,13 +85,16 @@ class Memory(MemoryBase):
               'memories': affected memories
               'graph': affected graph memories
 
-              'memories' and 'graph' is a dict, each with following subkeys:
+              'memories' and 'graph' is a dict, each with the following subkeys:
                 'add': added memory
                 'update': updated memory
                 'delete': deleted memory
-
-
         """
+        logger.debug(
+            'add: messages=%s\n user_id=%s\n agent_id=%s\n run_id=%s\n metadata=%s\n filters=%s\n prompt=%s',
+            messages, user_id, agent_id, run_id, metadata, filters, prompt,
+        )
+
         if metadata is None:
             metadata = {}
 
@@ -133,13 +137,25 @@ class Memory(MemoryBase):
             return vector_store_result
 
     def _add_to_vector_store(self, messages, metadata, filters):
-        parsed_messages = parse_messages(messages)
+        logger.debug(
+            '_add_to_vector_store:\n\tmessages=%s\n\tmetadata=%s\n\tfilters=%s',
+            messages, metadata, filters,
+        )
+        messages_as_str = stringify_messages(messages)
+        logger.debug(
+            '_add_to_vector_store:\n\tmessages_as_str=%s',
+            messages_as_str,
+        )
 
         if self.custom_prompt:
             system_prompt = self.custom_prompt
-            user_prompt = f"Input: {parsed_messages}"
+            user_prompt = f"Input: {messages_as_str}"
         else:
-            system_prompt, user_prompt = get_fact_retrieval_messages(parsed_messages)
+            system_prompt, user_prompt = get_fact_retrieval_messages(messages_as_str)
+        logger.debug(
+            '_add_to_vector_store:\n\tsystem_prompt=%s\n\tuser_prompt=%s',
+            system_prompt, user_prompt,
+        )
 
         response = self.llm.generate_response(
             messages=[
@@ -148,11 +164,15 @@ class Memory(MemoryBase):
             ],
             response_format={"type": "json_object"},
         )
+        logger.debug(
+            '_add_to_vector_store:\n\tresponse=%s',
+            response,
+        )
 
         try:
             new_retrieved_facts = json.loads(response)["facts"]
         except Exception as e:
-            logging.error(f"Error in new_retrieved_facts: {e}")
+            logger.error("error in new_retrieved_facts: %s", e)
             new_retrieved_facts = []
 
         retrieved_old_memory = []
@@ -168,7 +188,7 @@ class Memory(MemoryBase):
             for mem in existing_memories:
                 retrieved_old_memory.append({"id": mem.id, "text": mem.payload["data"]})
 
-        logging.info(f"Total existing memories: {len(retrieved_old_memory)}")
+        logger.info("total existing memories: %d", len(retrieved_old_memory))
 
         # mapping UUIDs with integers for handling UUID hallucinations
         temp_uuid_mapping = {}
@@ -177,17 +197,20 @@ class Memory(MemoryBase):
             retrieved_old_memory[idx]["id"] = str(idx)
 
         function_calling_prompt = get_update_memory_messages(retrieved_old_memory, new_retrieved_facts)
+        logger.debug("function_calling_prompt: %s", function_calling_prompt)
 
         new_memories_with_actions = self.llm.generate_response(
             messages=[{"role": "user", "content": function_calling_prompt}],
             response_format={"type": "json_object"},
         )
+        logger.debug("new_memories_with_actions: %s", new_memories_with_actions)
+
         new_memories_with_actions = json.loads(new_memories_with_actions)
 
         returned_memories = []
         try:
             for resp in new_memories_with_actions["memory"]:
-                logging.info(resp)
+                logger.info("resp: %s", resp)
                 try:
                     if resp["event"] == "ADD":
                         memory_id = self._create_memory(
@@ -225,11 +248,11 @@ class Memory(MemoryBase):
                             }
                         )
                     elif resp["event"] == "NONE":
-                        logging.info("NOOP for Memory.")
+                        logger.info("memory noop")
                 except Exception as e:
-                    logging.error(f"Error in new_memories_with_actions: {e}")
+                    logger.error("error in new_memories_with_actions: %s", e)
         except Exception as e:
-            logging.error(f"Error in new_memories_with_actions: {e}")
+            logger.error("error in new_memories_with_actions: %s", e)
 
         return returned_memories
 
@@ -369,7 +392,7 @@ class Memory(MemoryBase):
         ]
         return all_memories
 
-    def search(self, query, user_id=None, agent_id=None, run_id=None, limit=100, filters=None):
+    def search(self, query: str, user_id=None, agent_id=None, run_id=None, limit=100, filters=None):
         """
         Search for memories.
 
@@ -514,7 +537,7 @@ class Memory(MemoryBase):
         for memory in memories:
             self._delete_memory(memory.id)
 
-        logger.info(f"Deleted {len(memories)} memories")
+        logger.info("deleted %d memories", len(memories))
 
         if self.api_version == "v1.1" and self.enable_graph:
             self.graph.delete_all(filters)
@@ -534,7 +557,7 @@ class Memory(MemoryBase):
         return self.db.get_history(memory_id)
 
     def _create_memory(self, data, existing_embeddings, metadata=None):
-        logging.info(f"Creating memory with {data=}")
+        logger.info(f"Creating memory with {data=}")
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
         else:
@@ -596,7 +619,7 @@ class Memory(MemoryBase):
         return memory_id
 
     def _delete_memory(self, memory_id):
-        logging.info(f"Deleting memory with {memory_id=}")
+        logger.info(f"Deleting memory with {memory_id=}")
         existing_memory = self.vector_store.get(vector_id=memory_id)
         prev_value = existing_memory.payload["data"]
         self.vector_store.delete(vector_id=memory_id)
@@ -607,7 +630,7 @@ class Memory(MemoryBase):
         """
         Reset the memory store.
         """
-        logger.warning("Resetting all memories")
+        logger.warning("resetting all memories")
         self.vector_store.delete_col()
         self.vector_store = VectorStoreFactory.create(
             self.config.vector_store.provider, self.config.vector_store.config

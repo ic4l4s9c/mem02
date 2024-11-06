@@ -7,7 +7,7 @@ def get_fact_retrieval_messages(message):
     return FACT_RETRIEVAL_PROMPT, f"Input: {message}"
 
 
-def parse_messages(messages):
+def stringify_messages(messages) -> str:
     response = ""
     for msg in messages:
         if msg["role"] == "system":
